@@ -4,7 +4,7 @@
 
 #include <algorithm>
 #include <windows.h>
-#include <Shlobj.h>
+#include <shlobj.h>
 #include <crtdbg.h>
 #include <stdio.h>
 
