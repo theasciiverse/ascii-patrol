@@ -369,7 +369,7 @@ static void kitty_push(int type, char ch, bool down)
 // US layout shift for the punctuation keys
 static char kitty_shift(int c)
 {
-	static const char plain[] = "`1234567890-=[]\;',./";
+	static const char plain[] = "`1234567890-=[]\\;',./";
 	static const char shift[] = "~!@#$%^&*()_+{}|:\"<>?";
 	if (c>='a' && c<='z')
 		return c-'a'+'A';
