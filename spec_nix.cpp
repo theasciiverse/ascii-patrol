@@ -102,6 +102,11 @@ static void* dpy = 0;
 
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <spawn.h>
+#include <errno.h>
+
+extern char** environ;
 #include <termios.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1538,6 +1543,25 @@ static int hiscore_running=0;
 static HISCORE hiscore_async = {0,0,0,"",""};
 static bool hiscore_ready = false;
 
+// system() would ignore SIGINT and SIGQUIT while curl runs and then put
+// back what they were before, undoing the handlers terminal_init() sets
+// meanwhile, so Ctrl+C would no longer restore the terminal
+static int run_shell(const char* cmd)
+{
+	const char* argv[] = {"sh", "-c", cmd, 0};
+	pid_t pid;
+	if (posix_spawn(&pid, "/bin/sh", 0, 0, (char* const*)argv, environ))
+		return -1;
+
+	int status = 0;
+	while (waitpid(pid, &status, 0)<0)
+	{
+		if (errno!=EINTR)
+			return -1;
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 void* hiscore_proc(void* p)
 {
 	int err = 0;
@@ -1548,7 +1572,7 @@ void* hiscore_proc(void* p)
 	while (!end)
 	{
 		fflush(0);
-		err = system(hiscore_data->buf);
+		err = run_shell(hiscore_data->buf);
 
 		// check if we need to discard this data and re-fetch
 		pthread_mutex_lock(&hiscore_cs);
