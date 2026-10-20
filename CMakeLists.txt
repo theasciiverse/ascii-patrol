@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 
-project(ASCIIpatrol LANGUAGES CXX)
+project(ASCIIpatrol LANGUAGES C CXX)
 
 option(web "build WASM using emscripten")
 
@@ -18,8 +18,6 @@ elseif(UNIX)
   find_package(X11 REQUIRED)
   find_library(XI_LIBRARY NAMES Xi REQUIRED)
   find_path(XI_INCLUDE_DIR NAMES X11/extensions/XInput2.h REQUIRED)
-  find_library(PULSEAUDIO_LIBRARY NAMES pulse REQUIRED)
-  find_path(PULSEAUDIO_INCLUDE_DIR NAMES pulse/pulseaudio.h REQUIRED)
 endif()
 
 # --- main program
@@ -44,9 +42,9 @@ if(web)
 	target_include_directories(asciipat PRIVATE ${EMSCRIPTEN_INCLUDE_DIR})
 elseif(UNIX)
   target_compile_definitions(asciipat PRIVATE NIX)
-  target_sources(asciipat PRIVATE spec_nix.cpp)
-  target_link_libraries(asciipat PRIVATE X11::X11 ${XI_LIBRARY} ${PULSEAUDIO_LIBRARY})
-  target_include_directories(asciipat PRIVATE ${XI_INCLUDE_DIR} ${PULSEAUDIO_INCLUDE_DIR})
+  target_sources(asciipat PRIVATE spec_nix.cpp miniaudio/miniaudio.c)
+  target_link_libraries(asciipat PRIVATE X11::X11 ${XI_LIBRARY} ${CMAKE_DL_LIBS} m)
+  target_include_directories(asciipat PRIVATE ${XI_INCLUDE_DIR})
 elseif(WIN32)
   target_compile_definitions(asciipat PRIVATE WIN
   "$<$<BOOL:${MSVC}>:NOMINMAX;_CRT_SECURE_NO_WARNINGS>"

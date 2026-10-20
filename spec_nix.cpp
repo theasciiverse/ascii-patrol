@@ -9,7 +9,7 @@
 #include <pthread.h>
 
 #include <X11/extensions/XInput2.h>
-#include <pulse/pulseaudio.h>
+#include "miniaudio/miniaudio.h"
 
 static bool raw_keyboard = false;
 static bool use_xterm_256 = true;
@@ -46,12 +46,10 @@ static Window victim; // our victim
 	#define LINUX
 #endif
 
-// pollution from <pulse/pulseaudio.h>
 #ifdef MIN
 #undef MIN
 #endif
 
-// pollution from <pulse/pulseaudio.h>
 #ifdef MAX
 #undef MAX
 #endif
@@ -1473,12 +1471,10 @@ void app_exit()
 	_exit(0);
 }
 
-static pa_threaded_mainloop* audio_api = 0;
-static pa_context* audio_context = 0;
-static pa_stream* audio_stream = 0;
+static ma_device audio_device;
+static bool audio_open = false;
 
 static pthread_mutex_t audio_cs = PTHREAD_MUTEX_INITIALIZER;
-static volatile int audio_error = 0;
 
 // silence until conf fetch!
 static int mo3_gain = 0; //100;
@@ -1548,15 +1544,15 @@ static bool sfx_mix(VOICE* v, short* buf, int samples, int gain)
 	return true;
 }
 
-static void audio_stream_write_cb(pa_stream *p, size_t nbytes, void *user)
+static void audio_data_cb(ma_device* dev, void* out, const void* in, ma_uint32 frames)
 {
 	const int nch=2;
 	const int frq=44100;
 	const int smp=frq/4; // 0.25s buf
 
-	short pull[nch*smp];
+	short* pull = (short*)out;
 
-	int samples = nbytes / 4;
+	int samples = frames;
 
 	pthread_mutex_lock(&sfx_cs);
 	int mo3_vol = mo3_gain;
@@ -1622,258 +1618,59 @@ static void audio_stream_write_cb(pa_stream *p, size_t nbytes, void *user)
 			v=n;
 		}
 
-		// pa_stream_begin_write();
-		pa_stream_write(audio_stream, pull, s*nch*sizeof(short), 0/*free_cb*/, 0/*offset*/, PA_SEEK_RELATIVE);
-
+		pull+=nch*s;
 		samples-=s;
 	}
 
 	pthread_mutex_unlock(&sfx_cs);
 }
 
-static void audio_stream_state_cb(pa_stream *s, void *user)
-{
-	switch(pa_stream_get_state(audio_stream))
-	{
-		case PA_STREAM_CREATING:
-		{
-			printf("Pulse: Stream creating...\n");
-			break;
-		}
-
-		case PA_STREAM_READY:
-		{
-			printf("Pulse: Stream ready now\n");
-
-			audio_error=0;
-			pthread_mutex_unlock(&audio_cs);
-			break;
-		}
-
-		case PA_STREAM_UNCONNECTED:
-		case PA_STREAM_TERMINATED:
-		case PA_STREAM_FAILED:
-		{
-			printf("Pulse: Stream connection failed\n");
-
-			pa_stream_unref(audio_stream);
-			audio_stream = 0;
-
-			audio_error=-6;
-			pthread_mutex_unlock(&audio_cs);
-			break;
-		}
-	}
-}
-
-static void audio_init_stream()
-{
-	int error;
-	pa_sample_spec ss;
-	pa_channel_map map;
-
-	ss.format = PA_SAMPLE_S16LE;
-	ss.channels = 2;
-	ss.rate = 44100;
-
-	/* init channel map */
-	pa_channel_map_init_stereo(&map);
-
-	/* check sample spec */
-	if(!pa_sample_spec_valid(&ss))
-	{
-		audio_error = -2;
-		pthread_mutex_unlock(&audio_cs);
-		return;
-	}
-
-	/* create the stream */
-	audio_stream = pa_stream_new(audio_context, "ascii-patrol", &ss, &map);
-	if(!audio_stream)
-	{
-		printf("Pulse: Error creating stream.\n");
-		audio_error = -3;
-		pthread_mutex_unlock(&audio_cs);
-		return;
-	}
-
-	pa_stream_set_write_callback(audio_stream, audio_stream_write_cb, 0/*user*/);
-	pa_stream_set_state_callback(audio_stream, audio_stream_state_cb, 0/*user*/);
-
-	pa_buffer_attr attr={0};
-	attr.fragsize = (uint32_t)-1;
-	attr.tlength = 44100*2*sizeof(short) * 20/1000;
-	attr.maxlength = attr.tlength;
-	attr.minreq = 0;
-	attr.prebuf = (uint32_t)-1;
-
-	error = pa_stream_connect_playback(audio_stream, 0, &attr,
-			pa_stream_flags(
-				PA_STREAM_AUTO_TIMING_UPDATE |
-				PA_STREAM_ADJUST_LATENCY |
-				PA_STREAM_INTERPOLATE_TIMING |
-			0),
-			0/*vol*/, 0);
-
-	if(error < 0)
-	{
-		pa_stream_unref(audio_stream);
-		audio_stream = 0;
-
-		printf("Pulse: Failed connecting stream.\n");
-		audio_error = -4;
-		pthread_mutex_unlock(&audio_cs);
-		return;
-	}
-}
-
-static void audio_context_state_cb(pa_context* c, void* user)
-{
-	switch (pa_context_get_state(c))
-	{
-		case PA_CONTEXT_CONNECTING:
-		{
-			printf("Pulse: Context connecting...\n");
-			break;
-		}
-		case PA_CONTEXT_AUTHORIZING:
-		{
-			printf("Pulse: Context authorizing...\n");
-			break;
-		}
-		case PA_CONTEXT_SETTING_NAME:
-		{
-			printf("Pulse: Context setting name...\n");
-			break;
-		}
-		case PA_CONTEXT_READY:
-		{
-			printf("Pulse: Context ready now.\n");
-			audio_init_stream();
-			break;
-		}
-		case PA_CONTEXT_TERMINATED:
-		case PA_CONTEXT_FAILED:
-		{
-			printf("Pulse: Connection failed.\n");
-			audio_error = -1;
-			pthread_mutex_unlock(&audio_cs);
-			break;
-		}
-	}
-}
-
+// miniaudio picks the system's sound (PulseAudio, PipeWire, ALSA, Core Audio);
+// without one the game runs silent
 void init_sound()
 {
-	audio_api = pa_threaded_mainloop_new();
-	if (!audio_api)
+	ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
+	cfg.playback.format = ma_format_s16;
+	cfg.playback.channels = 2;
+	cfg.sampleRate = 44100;
+	cfg.periodSizeInMilliseconds = 20;
+	cfg.dataCallback = audio_data_cb;
+
+	if (ma_device_init(0, &cfg, &audio_device) != MA_SUCCESS)
 		return;
 
-	pa_proplist *plist = pa_proplist_new();
-
-	pa_proplist_sets(plist, PA_PROP_APPLICATION_NAME, "ascii-patrol");
-	pa_proplist_sets(plist, PA_PROP_APPLICATION_VERSION, "alpha 2.0");
-	pa_proplist_sets(plist, PA_PROP_MEDIA_ROLE, "game");
-
-	audio_context = pa_context_new_with_proplist( pa_threaded_mainloop_get_api(audio_api), "ascii-patrol", plist );
-
-	pa_proplist_free(plist);
-
-	if (!audio_context)
-	{
-		pa_threaded_mainloop_free(audio_api);
-		audio_api = 0;
-		return;
-	}
-
-	pa_context_set_state_callback(audio_context, audio_context_state_cb, 0/*user*/);
-
-	int error = pa_context_connect(audio_context, NULL, (pa_context_flags_t)0, NULL);
-
-	if(error < 0)
-	{
-		// no demon, excellent
-		// player won't be loaded unnecessarily
-		pa_context_unref(audio_context);
-		audio_context = 0;
-		pa_threaded_mainloop_free(audio_api);
-		audio_api = 0;
-		return;
-	}
-
-	pthread_mutex_lock(&audio_cs);
-
-	// !!!
 	load_player();
 
-	audio_error = 1; // pending
-	error = pa_threaded_mainloop_start(audio_api);
+	unsigned int id[96];
+	int count = get_sfx_ids(id);
 
-	if(error < 0)
+	for (int i=0; i<count; i++)
 	{
-		pa_context_unref(audio_context);
-		audio_context = 0;
-		pa_threaded_mainloop_free(audio_api);
-		audio_api = 0;
-
-		audio_error = -5;
-		pthread_mutex_unlock(&audio_cs);
+		int size=0;
+		short* data = get_sfx_sample(id[i],&size);
+		sfx_buf[ id[i] ].data = data;
+		sfx_buf[ id[i] ].size = size;
 	}
-	else
+
+	if (ma_device_start(&audio_device) != MA_SUCCESS)
 	{
-		// wait here for async error or success
-		pthread_mutex_lock(&audio_cs);
-		pthread_mutex_unlock(&audio_cs);
-
-		if (audio_error < 0)
-		{
-			pa_threaded_mainloop_stop(audio_api);
-
-			pa_context_unref(audio_context);
-			audio_context = 0;
-
-			pa_threaded_mainloop_free(audio_api);
-			audio_api = 0;
-		}
-		else
-		{
-			// FULL SUCCESS
-
-			// now, let's try to upload our samples
-
-			unsigned int id[96];
-			int count = get_sfx_ids(id);
-
-			for (int i=0; i<count; i++)
-			{
-				int size=0;
-				short* data = get_sfx_sample(id[i],&size);
-				sfx_buf[ id[i] ].data = data;
-				sfx_buf[ id[i] ].size = size;
-			}
-		}
+		ma_device_uninit(&audio_device);
+		return;
 	}
+
+	audio_open = true;
 }
 
 void free_sound()
 {
-	if (audio_api)
+	if (audio_open)
 	{
-		pa_context_disconnect(audio_context);
-		pa_threaded_mainloop_stop(audio_api);
+		ma_device_uninit(&audio_device);
+		audio_open = false;
 
-		pa_context_unref(audio_context);
-		audio_context = 0;
-
-		pa_threaded_mainloop_free(audio_api);
-		audio_api = 0;
-
-		//pthread_mutex_lock(&sfx_cs);
 		stop_sfx(-1);
 		sfx_voice = sfx_fade;
 		stop_sfx(-1);
-		//pthread_mutex_unlock(&sfx_cs);
-
 	}
 }
 
@@ -1905,7 +1702,7 @@ void unlock_player()
 
 bool play_sfx(unsigned int id, void** voice, bool loop, int vol, int pan)
 {
-	if (!audio_context)
+	if (!audio_open)
 		return false;
 
 	pthread_mutex_lock(&sfx_cs);
