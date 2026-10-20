@@ -1725,13 +1725,13 @@ void get_hiscore(int ofs, const char* id)
 
 	if (id && id[0])
 	{
-		sprintf_s(cmd,1024,
+		snprintf(cmd,sizeof(cmd),
 			"curl --silent -o \"%s\" \"http://ascii-patrol.com/rank.php?rank=%d&id=%s\" 2>/dev/null"
 			,path,ofs+1,id);
 	}
 	else
 	{
-		sprintf_s(cmd,1024,
+		snprintf(cmd,sizeof(cmd),
 			"curl --silent -o \"%s\" \"http://ascii-patrol.com/rank.php?rank=%d\" 2>/dev/null"
 			,path,ofs+1);
 	}
@@ -1744,7 +1744,7 @@ void post_hiscore()
 	const char* path = rank_path();
 
 	char cmd[1024];
-	sprintf_s(cmd,1024,
+	snprintf(cmd,sizeof(cmd),
 		"curl --silent -o \"%s\" -F \"rec=@%s\" \"http://ascii-patrol.com/rank.php\" 2>/dev/null"
 		,path,
 		record_path());
