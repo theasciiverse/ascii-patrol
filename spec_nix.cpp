@@ -1325,6 +1325,14 @@ void free_con_output(CON_OUTPUT* screen)
 	screen->arr = 0;
 }
 
+// terminal size at the last write; a change clears the terminal and
+// draws everything again
+static int written_w = -1;
+static int written_h = -1;
+
+// Each changed row is drawn at its own position: the screen is centred
+// on a terminal bigger than the game's largest (160x50) and clipped,
+// not scrolled, on one smaller than its smallest (80x25)
 int screen_write(CON_OUTPUT* screen, int dw, int dh, int sx, int sy, int sw, int sh)
 {
 	int w = screen->w;
@@ -1333,159 +1341,71 @@ int screen_write(CON_OUTPUT* screen, int dw, int dh, int sx, int sy, int sw, int
 	char* color = screen->color;
 	char* arr = (char*)screen->arr;
 
-	ansi_goto_xy(0,0);
-
-	if (!color)
-		ansi_set_color_ex(0,15);
-	else
-	{
-		for (int y=0; y<sh; y++)
-			color[(w+1)*y+w] = color[(w+1)*y+w-1];
-		if (arr)
-			for (int y=0; y<sh; y++)
-				arr[(w+1)*(y+h)+w] = color[(w+1)*y+w];
-	}
+	int tw = 0, th = 0;
+	get_wh(&tw,&th);
+	int ox = tw>sw ? (tw-sw)/2 : 0;
+	int oy = th>sh ? (th-sh)/2 : 0;
 
 	int size = 0;
 
-	if (arr)
+	if (tw!=written_w || th!=written_h)
 	{
-		// compare line by line (winner)
-		char cr[51];
-		memset(cr,'\n',50);
-		cr[50]=0;
-
-		int i=0;
-		int j=0;
-		while (i<sh)
+		written_w = tw;
+		written_h = th;
+		if (arr)
 		{
-			while (i<sh &&
-				memcmp(buf+(w+1)*i,arr+(w+1)*i,w+1)==0 &&
-				(!color || memcmp(color+(w+1)*i,arr+(w+1)*(i+h),w+1)==0))
-				i++;
-
-			if (i>=sh)
-				break;
-
-			if (i>j)
-				size += printf("%s",cr + (50 - (i-j)) - (j>0));
-
-			memcpy(arr+(w+1)*i,buf+(w+1)*i,w+1);
-			if (color)
-				memcpy(arr+(w+1)*(i+h),color+(w+1)*i,w+1);
-
-
-			j=i+1;
-			while (j<sh)
-			{
-				if (memcmp(buf+(w+1)*j,arr+(w+1)*j,w+1)==0 &&
-					(!color|| memcmp(color+(w+1)*j,arr+(w+1)*(j+h),w+1)==0))
-				{
-					break;
-				}
-				else
-				{
-					memcpy(arr+(w+1)*j,buf+(w+1)*j,w+1);
-					if (color)
-						memcpy(arr+(w+1)*(j+h),color+(w+1)*j,w+1);
-
-				}
-				j++;
-			}
-
-			// clip
-			if (!color)
-			{
-				char swap = buf[(w+1)*j-1];
-				buf[(w+1)*j-1] = 0;
-
-				size += printf("%s",buf+(w+1)*i);
-
-				// unclip
-				buf[(w+1)*j-1] = swap;
-			}
-			else
-			{
-				int cl = 256;
-				int from = (w+1)*i;
-				for (int y=i; y<j; y++)
-				{
-					for (int x=0; x<=sw; x++)
-					{
-						if (color[(w+1)*y+x]!=cl || x==sw && y==j-1)
-						{
-							int chars = (w+1)*y+x - from;
-							if (chars)
-							{
-								size += ansi_set_color_ex(cl&0x0F,(cl>>4)&0x0F);
-								char swap = buf[(w+1)*y+x];
-								buf[(w+1)*y+x]=0;
-								printf("%s",buf+from);
-								buf[(w+1)*y+x]=swap;
-								from = (w+1)*y+x;
-								size += chars;
-							}
-							cl = color[(w+1)*y+x];
-						}
-					}
-				}
-			}
-
-			i=j;
+			delete [] arr;
+			screen->arr = arr = 0;
 		}
+		size += ansi_def_color();
+		size += printf("\x1B[2J");
 	}
-	else
+
+	int cols = sw;
+	if (ox+cols>tw)
+		cols = tw-ox;
+
+	int cl = 256;
+	if (!color)
+		size += ansi_set_color_ex(0,15);
+
+	for (int y=0; y<sh && oy+y<th; y++)
 	{
+		char* row = buf+(w+1)*y;
+		char* row_cl = color ? color+(w+1)*y : 0;
+
+		if (arr && memcmp(row,arr+(w+1)*y,w+1)==0 &&
+			(!color || memcmp(row_cl,arr+(w+1)*(y+h),w+1)==0))
+			continue;
+
+		size += ansi_goto_xy(ox,oy+y);
+
 		if (!color)
 		{
-			// clip
-			char swap = buf[(w+1)*sh-1];
-			buf[(w+1)*sh-1] = 0;
-
-			printf("%s",buf);
-
-			// unclip
-			buf[(w+1)*sh-1] = swap;
-
-			arr = new char[(w+1)*h];
-			memcpy(arr,buf,(w+1)*h);
-
-			size = (w+1)*sh;
-
-			screen->arr = arr;
+			size += fwrite(row,1,cols,stdout);
+			continue;
 		}
-		else
+
+		int from = 0;
+		for (int x=0; x<=cols; x++)
 		{
-			int from = 0;
-			int cl = 256;
-			for (int y=0; y<sh; y++)
+			if (x<cols && (unsigned char)row_cl[x]==cl)
+				continue;
+			if (x>from)
+				size += fwrite(row+from,1,x-from,stdout);
+			if (x<cols)
 			{
-				for (int x=0; x<=sw; x++)
-				{
-					if (color[(w+1)*y+x]!=cl  || x==sw && y==sh-1)
-					{
-						int chars = (w+1)*y+x - from;
-						if (chars)
-						{
-							size += ansi_set_color_ex(cl&0x0F,(cl>>4)&0x0F);
-							char swap = buf[(w+1)*y+x];
-							buf[(w+1)*y+x]=0;
-							printf("%s",buf+from);
-							buf[(w+1)*y+x]=swap;
-							from = (w+1)*y+x;
-							size += chars;
-						}
-						cl = color[(w+1)*y+x];
-					}
-				}
+				cl = (unsigned char)row_cl[x];
+				size += ansi_set_color_ex(cl&0x0F,(cl>>4)&0x0F);
 			}
-
-			arr = new char[(w+1)*h*2];
-			memcpy(arr,buf,(w+1)*h*2);
-
-			screen->arr = arr;
+			from = x;
 		}
 	}
+
+	int bytes = (w+1)*h*(color ? 2 : 1);
+	if (!arr)
+		screen->arr = arr = new char[bytes];
+	memcpy(arr,buf,bytes);
 
 	fflush(stdout);
 	return size;
