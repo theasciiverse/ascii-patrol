@@ -29,6 +29,7 @@ static Window victim; // our victim
 
 
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1099,19 +1100,72 @@ void write_fs()
 {
 }
 
+static void make_dirs(const char* dir)
+{
+	char path[1024];
+	snprintf(path,sizeof(path),"%s",dir);
+	for (char* c=path+1; *c; c++)
+	{
+		if (*c=='/')
+		{
+			*c=0;
+			mkdir(path,0755);
+			*c='/';
+		}
+	}
+	mkdir(path,0755);
+}
+
+// Player files live in $XDG_DATA_HOME/ascii-patrol (~/.local/share/ascii-patrol)
+static const char* data_dir()
+{
+	static char dir[1024]="";
+
+	if (!dir[0])
+	{
+		const char* xdg = getenv("XDG_DATA_HOME");
+		const char* home = getenv("HOME");
+		if (xdg && xdg[0]=='/')
+			snprintf(dir,sizeof(dir),"%s/ascii-patrol",xdg);
+		else
+		if (home && home[0])
+			snprintf(dir,sizeof(dir),"%s/.local/share/ascii-patrol",home);
+		else
+			strcpy(dir,".");
+		make_dirs(dir);
+	}
+
+	return dir;
+}
+
+// $<env>/<name> if set, else a file an older version left in $HOME,
+// else the data folder
+static void player_path(char* path, int size, const char* env, const char* name)
+{
+	const char* dir = getenv(env);
+	if (dir && dir[0])
+	{
+		snprintf(path,size,"%s/%s",dir,name);
+		return;
+	}
+
+	const char* home = getenv("HOME");
+	if (home && home[0])
+	{
+		snprintf(path,size,"%s/%s",home,name);
+		if (access(path,F_OK)==0)
+			return;
+	}
+
+	snprintf(path,size,"%s/%s",data_dir(),name);
+}
+
 const char* conf_path()
 {
 	static char path[1024]="";
 
 	if (!path[0])
-	{
-		const char* dir = getenv("ASCII_PATROL_CONFIG_DIR");
-		if (!dir || !dir[0])
-			dir = getenv("HOME");
-		if (!dir || !dir[0])
-			dir = ".";
-		sprintf_s(path,1024,"%s/asciipat.cfg", dir);
-	}
+		player_path(path,sizeof(path),"ASCII_PATROL_CONFIG_DIR","asciipat.cfg");
 
 	return path;
 }
@@ -1121,14 +1175,7 @@ const char* record_path()
 	static char path[1024]="";
 
 	if (!path[0])
-	{
-		const char* dir = getenv("ASCII_PATROL_RECORD_DIR");
-		if (!dir || !dir[0])
-			dir = getenv("HOME");
-		if (!dir || !dir[0])
-			dir=".";
-		sprintf_s(path,1024,"%s/asciipat.rec", dir);
-	}
+		player_path(path,sizeof(path),"ASCII_PATROL_RECORD_DIR","asciipat.rec");
 
 	return path;
 }
@@ -1141,11 +1188,19 @@ const char* shot_path()
 	{
 		const char* dir = getenv("ASCII_PATROL_SHOT_DIR");
 		if (!dir || !dir[0])
-			dir = getenv("HOME");
-		if (!dir || !dir[0])
-			dir=".";
-		sprintf_s(path,1024,"%s/", dir);
+			dir = data_dir();
+		snprintf(path,sizeof(path),"%s/", dir);
 	}
+
+	return path;
+}
+
+static const char* rank_path()
+{
+	static char path[1024]="";
+
+	if (!path[0])
+		snprintf(path,sizeof(path),"%s/asciipat.rnk", data_dir());
 
 	return path;
 }
@@ -1164,11 +1219,7 @@ void* hiscore_proc(void* p)
 	int err = 0;
 	bool end = false;
 
-	static char path[1024];
-	const char* home = getenv("HOME");
-	if (!home || !home[0])
-		home=".";
-	sprintf_s(path,1024,"%s/asciipat.rnk", home);
+	const char* path = rank_path();
 
 	while (!end)
 	{
@@ -1320,11 +1371,7 @@ void get_hiscore(int ofs, const char* id)
 	if (hiscore_sync)
 		return;
 
-	static char path[1024];
-	const char* home = getenv("HOME");
-	if (!home || !home[0])
-		home=".";
-	sprintf_s(path,1024,"%s/asciipat.rnk", home);
+	const char* path = rank_path();
 
 	char cmd[1024];
 
@@ -1346,11 +1393,7 @@ void get_hiscore(int ofs, const char* id)
 
 void post_hiscore()
 {
-	static char path[1024];
-	const char* home = getenv("HOME");
-	if (!home || !home[0])
-		home=".";
-	sprintf_s(path,1024,"%s/asciipat.rnk", home);
+	const char* path = rank_path();
 
 	char cmd[1024];
 	sprintf_s(cmd,1024,
