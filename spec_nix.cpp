@@ -95,7 +95,7 @@ bool get_input_len(int* r)
 	if (!dpy)
 	{
 		ioctl( fileno(stdin), FIONREAD, r);
-		r+=read_len;
+		*r+=read_len;
 		return true;
 	}
 
@@ -803,7 +803,7 @@ int terminal_init(int argc, char* argv[], int* dw, int* dh)
 	// try to enable mouse events (enough to track moves when left button is down only)
 
 	const char* term = getenv("TERM");
-	if (strcmp(term,"linux")==0)
+	if (term && strcmp(term,"linux")==0)
 		use_xterm_256 = false;
 
     initTermios();
