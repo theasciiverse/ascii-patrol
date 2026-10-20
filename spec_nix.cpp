@@ -1,18 +1,87 @@
 
 #ifdef NIX
 
+#ifndef __APPLE__
+#define HAVE_X11
+#endif
 
+#ifdef HAVE_X11
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xresource.h>
 #include <X11/XKBlib.h>
+#include <X11/extensions/XInput2.h>
+#include <dlfcn.h>
+#endif
 #include <pthread.h>
 
-#include <X11/extensions/XInput2.h>
 #include "miniaudio/miniaudio.h"
 
 static bool raw_keyboard = false;
 static bool use_xterm_256 = true;
+
+// key presses and releases from a terminal speaking the kitty keyboard
+// protocol (sw.kovidgoyal.net/kitty/keyboard-protocol)
+static bool kitty_keyboard = false;
+
+#ifdef HAVE_X11
+// libX11 and libXi are loaded at run time, so the game also starts
+// where they are not installed
+static struct
+{
+	Display* (*OpenDisplay)(const char*);
+	int (*CloseDisplay)(Display*);
+	int (*Pending)(Display*);
+	int (*NextEvent)(Display*, XEvent*);
+	Bool (*GetEventData)(Display*, XGenericEventCookie*);
+	void (*FreeEventData)(Display*, XGenericEventCookie*);
+	Status (*kbGetIndicatorState)(Display*, unsigned int, unsigned int*);
+	int (*GetInputFocus)(Display*, Window*, int*);
+	int (*SelectInput)(Display*, Window, long);
+	Bool (*kbSetDetectableAutoRepeat)(Display*, Bool, Bool*);
+	Bool (*QueryExtension)(Display*, const char*, int*, int*, int*);
+	int (*Flush)(Display*);
+	int (*ISelectEvents)(Display*, Window, XIEventMask*, int);
+} x11;
+
+#define XOpenDisplay x11.OpenDisplay
+#define XCloseDisplay x11.CloseDisplay
+#define XPending x11.Pending
+#define XNextEvent x11.NextEvent
+#define XGetEventData x11.GetEventData
+#define XFreeEventData x11.FreeEventData
+#define XkbGetIndicatorState x11.kbGetIndicatorState
+#define XGetInputFocus x11.GetInputFocus
+#define XSelectInput x11.SelectInput
+#define XkbSetDetectableAutoRepeat x11.kbSetDetectableAutoRepeat
+#define XQueryExtension x11.QueryExtension
+#define XFlush x11.Flush
+#define XISelectEvents x11.ISelectEvents
+
+static bool load_x11()
+{
+	void* x = dlopen("libX11.so.6", RTLD_NOW|RTLD_LOCAL);
+	void* xi = x ? dlopen("libXi.so.6", RTLD_NOW|RTLD_LOCAL) : 0;
+	if (!xi)
+		return false;
+
+	#define X11_SYM(lib,f,name) if (!(*(void**)&x11.f = dlsym(lib,name))) return false;
+	X11_SYM(x, OpenDisplay, "XOpenDisplay")
+	X11_SYM(x, CloseDisplay, "XCloseDisplay")
+	X11_SYM(x, Pending, "XPending")
+	X11_SYM(x, NextEvent, "XNextEvent")
+	X11_SYM(x, GetEventData, "XGetEventData")
+	X11_SYM(x, FreeEventData, "XFreeEventData")
+	X11_SYM(x, kbGetIndicatorState, "XkbGetIndicatorState")
+	X11_SYM(x, GetInputFocus, "XGetInputFocus")
+	X11_SYM(x, SelectInput, "XSelectInput")
+	X11_SYM(x, kbSetDetectableAutoRepeat, "XkbSetDetectableAutoRepeat")
+	X11_SYM(x, QueryExtension, "XQueryExtension")
+	X11_SYM(x, Flush, "XFlush")
+	X11_SYM(xi, ISelectEvents, "XISelectEvents")
+	#undef X11_SYM
+	return true;
+}
 
 static bool use_xi = false;
 static int xi_opcode = -1;
@@ -20,6 +89,9 @@ static Display* dpy = 0;
 static Window win; // current focus
 static Window root; // default root
 static Window victim; // our victim
+#else
+static void* dpy = 0;
+#endif
 
 #include <string.h>
 
@@ -65,7 +137,7 @@ void DBG(const char* str)
 
 bool has_key_releases()
 {
-	return dpy!=0 || raw_keyboard;
+	return dpy!=0 || raw_keyboard || kitty_keyboard;
 }
 
 int fopen_s(FILE** f, const char* path, const char* mode)
@@ -89,17 +161,29 @@ unsigned int get_time()
 static char read_buf[3];
 static int  read_len=0;
 
+static void kitty_pump();
+static int kitty_events();
+
 bool get_input_len(int* r)
 {
-	if (!dpy)
+	if (kitty_keyboard)
 	{
-		ioctl( fileno(stdin), FIONREAD, r);
-		*r+=read_len;
+		kitty_pump();
+		*r = kitty_events();
 		return true;
 	}
 
-	*r = XPending(dpy);
-    return true;
+#ifdef HAVE_X11
+	if (dpy)
+	{
+		*r = XPending(dpy);
+		return true;
+	}
+#endif
+
+	ioctl( fileno(stdin), FIONREAD, r);
+	*r+=read_len;
+	return true;
 }
 
 char read_char()
@@ -246,6 +330,231 @@ static const int key_map[]=
    '~`',0,'|\\','Zz','Xx','Cc','Vv','Bb','Nn','Mm','<,','>.','?/',0,
 };
 
+// kitty keyboard protocol: every key arrives as CSI ... u (or CSI ... ~ and
+// CSI 1;... A-D, H, F for the cursor and editing keys), with its
+// modifiers and whether it was pressed, repeated or released
+static unsigned char kitty_buf[512];
+static int kitty_len = 0;
+static CON_INPUT kitty_queue[256];
+static int kitty_head = 0;
+static int kitty_tail = 0;
+
+static int kitty_events()
+{
+	return (kitty_tail - kitty_head) & 255;
+}
+
+static void kitty_push(int type, char ch, bool down)
+{
+	if (((kitty_tail+1) & 255) == kitty_head)
+		return; // full, drop
+
+	CON_INPUT* ir = kitty_queue + kitty_tail;
+	ir->EventType = type;
+	if (type == CON_INPUT_FOC)
+		ir->Event.FocusEvent.bSetFocus = down;
+	else
+	{
+		ir->Event.KeyEvent.bKeyDown = down;
+		ir->Event.KeyEvent.uChar.AsciiChar = ch;
+	}
+	kitty_tail = (kitty_tail+1) & 255;
+}
+
+// US layout shift for the punctuation keys
+static char kitty_shift(int c)
+{
+	static const char plain[] = "`1234567890-=[]\;',./";
+	static const char shift[] = "~!@#$%^&*()_+{}|:\"<>?";
+	if (c>='a' && c<='z')
+		return c-'a'+'A';
+	const char* p = strchr(plain,c);
+	return p ? shift[p-plain] : c;
+}
+
+// one sequence's parameters: up to 3 fields of up to 3 ':' parts each
+static void kitty_key(const char* par, char final)
+{
+	int f[3][3] = {{0,0,0},{1,1,0},{0,0,0}};
+	bool given[3][3] = {{false}};
+	int fi = 0, pi = 0;
+	for (const char* c = par; *c; c++)
+	{
+		if (*c==';')
+		{
+			if (++fi>2) break;
+			pi = 0;
+		}
+		else
+		if (*c==':')
+		{
+			if (++pi>2) pi = 2;
+		}
+		else
+		if (*c>='0' && *c<='9')
+		{
+			if (!given[fi][pi])
+				f[fi][pi] = 0;
+			given[fi][pi] = true;
+			f[fi][pi] = f[fi][pi]*10 + (*c-'0');
+		}
+	}
+
+	int key = given[0][0] ? f[0][0] : 1;
+	int mods = (given[1][0] ? f[1][0] : 1) - 1;
+	int ev = given[1][1] ? f[1][1] : 1;
+	bool down = ev != 3;
+	bool shift = mods & 1;
+	bool ctrl = mods & 4;
+	bool caps = mods & 64;
+
+	char ch = 0;
+	switch (final)
+	{
+		case 'A': ch = KBD_UP; break;
+		case 'B': ch = KBD_DN; break;
+		case 'C': ch = KBD_RT; break;
+		case 'D': ch = KBD_LT; break;
+		case 'H': ch = KBD_HOM; break;
+		case 'F': ch = KBD_END; break;
+		case '~':
+			switch (key)
+			{
+				case 1: case 7: ch = KBD_HOM; break;
+				case 2: ch = KBD_INS; break;
+				case 3: ch = KBD_DEL; break;
+				case 4: case 8: ch = KBD_END; break;
+				case 5: ch = KBD_PUP; break;
+				case 6: ch = KBD_PDN; break;
+			}
+			break;
+		case 'u':
+			if (key==13 || key==57414)
+				ch = 13;
+			else
+			if (key==9)
+				ch = '\t';
+			else
+			if (key==127 || key==8)
+				ch = 8;
+			else
+			if (key==27)
+				ch = 27;
+			else
+			if (key>=57399 && key<=57408)
+				ch = '0' + key-57399; // keypad digits
+			else
+			if (key>=57409 && key<=57413)
+				ch = "./*-+"[key-57409]; // keypad operators
+			else
+			if (key>=57417 && key<=57426)
+			{
+				static const char kp[] = {KBD_LT,KBD_RT,KBD_UP,KBD_DN,KBD_PUP,KBD_PDN,KBD_HOM,KBD_END,KBD_INS,KBD_DEL};
+				ch = kp[key-57417];
+			}
+			else
+			if (key>=32 && key<127)
+			{
+				bool upper = shift;
+				if (key>='a' && key<='z' && caps)
+					upper = !upper;
+				if (shift && given[0][1] && f[0][1]>=32 && f[0][1]<127 && !(key>='a' && key<='z' && caps))
+					ch = f[0][1];
+				else
+				if (upper)
+					ch = kitty_shift(key);
+				else
+					ch = key;
+
+				if (ctrl && down && (key=='c' || key=='C'))
+				{
+					raise(SIGINT);
+					return;
+				}
+			}
+			break;
+	}
+
+	if (ch)
+		kitty_push(CON_INPUT_KBD, ch, down);
+}
+
+static void kitty_pump()
+{
+	int avail = 0;
+	ioctl( 0, FIONREAD, &avail);
+	while (avail>0 && kitty_len < (int)sizeof(kitty_buf))
+	{
+		int n = read(0, kitty_buf+kitty_len, sizeof(kitty_buf)-kitty_len);
+		if (n<=0)
+			break;
+		kitty_len += n;
+		avail -= n;
+	}
+
+	int i = 0;
+	while (i<kitty_len)
+	{
+		unsigned char c = kitty_buf[i];
+		if (c!=27)
+		{
+			// plain byte (pasted text): a press and a release
+			char ch = c==10 ? 13 : c==127 ? 8 : c;
+			kitty_push(CON_INPUT_KBD, ch, true);
+			kitty_push(CON_INPUT_KBD, ch, false);
+			i++;
+			continue;
+		}
+
+		if (i+1>=kitty_len)
+			break; // wait for the rest
+
+		if (kitty_buf[i+1]!='[')
+		{
+			kitty_push(CON_INPUT_KBD, 27, true);
+			kitty_push(CON_INPUT_KBD, 27, false);
+			i++;
+			continue;
+		}
+
+		int j = i+2;
+		while (j<kitty_len && (kitty_buf[j]<0x40 || kitty_buf[j]>0x7E))
+			j++;
+		if (j>=kitty_len)
+		{
+			if (kitty_len - i >= 64)
+				i = kitty_len; // garbage, drop it
+			break;
+		}
+
+		char par[64];
+		int len = j-(i+2);
+		if (len>63)
+			len = 63;
+		memcpy(par, kitty_buf+i+2, len);
+		par[len] = 0;
+		char final = kitty_buf[j];
+		i = j+1;
+
+		if (final=='I' && !len)
+			kitty_push(CON_INPUT_FOC, 0, true);
+		else
+		if (final=='O' && !len)
+			kitty_push(CON_INPUT_FOC, 0, false);
+		else
+		if (len && (par[0]<'0' || par[0]>';'))
+			continue; // a reply such as CSI ? ... u, not a key
+		else
+			kitty_key(par, final);
+	}
+
+	if (i)
+	{
+		memmove(kitty_buf, kitty_buf+i, kitty_len-i);
+		kitty_len -= i;
+	}
+}
+
 bool spec_read_input(CON_INPUT* ir, int n, int* r)
 {
 	int nm = 0;
@@ -361,6 +670,20 @@ bool spec_read_input(CON_INPUT* ir, int n, int* r)
 		return true;
 	}
 
+	if (kitty_keyboard)
+	{
+		kitty_pump();
+		int i=0;
+		while (i<n && kitty_head!=kitty_tail)
+		{
+			ir[i++] = kitty_queue[kitty_head];
+			kitty_head = (kitty_head+1) & 255;
+		}
+		if (r)
+			*r = i;
+		return true;
+	}
+
 	if (!dpy)
 	{
 		for (int i=0; i<n; i++)
@@ -384,6 +707,7 @@ bool spec_read_input(CON_INPUT* ir, int n, int* r)
 	    return true;
 	}
 
+#ifdef HAVE_X11
 	// in non grabbed way: eat all from stdin if submitted
 	int discard;
 	ioctl( fileno(stdin), FIONREAD, &discard);
@@ -582,6 +906,7 @@ bool spec_read_input(CON_INPUT* ir, int n, int* r)
 
 	if (r)
 		*r = i;
+#endif
 
 	return true;
 }
@@ -735,10 +1060,18 @@ void free_sound();
 
 void terminal_done()
 {
+#ifdef HAVE_X11
 	if (dpy)
 	{
 		XCloseDisplay(dpy);
 		dpy = 0;
+	}
+#endif
+
+	if (kitty_keyboard)
+	{
+		printf("\x1B[?1004l\x1B[<u");
+		kitty_keyboard = false;
 	}
 
 	resetTermios();
@@ -762,6 +1095,62 @@ static void terminal_signal(int signum)
 }
 
 
+// asks for the kitty keyboard protocol's flags, then for the primary
+// device attributes, which every terminal answers; only a terminal
+// that knows the protocol answers the first
+static bool detect_kitty()
+{
+	printf("\x1B[?u\x1B[c");
+	fflush(stdout);
+
+	char buf[256];
+	int len = 0;
+	unsigned int start = get_time();
+	while (get_time()-start < 500 && len < (int)sizeof(buf)-1)
+	{
+		fd_set fds;
+		FD_ZERO(&fds);
+		FD_SET(0,&fds);
+		struct timeval tv = {0, 50000};
+		if (select(1,&fds,0,0,&tv)<=0)
+			continue;
+		int n = read(0, buf+len, sizeof(buf)-1-len);
+		if (n<=0)
+			break;
+		len += n;
+		buf[len] = 0;
+
+		// done at the device attributes: CSI ? ... c
+		char* da = strstr(buf,"\x1B[?");
+		bool done = false;
+		while (da)
+		{
+			char* e = da+3;
+			while (*e && ((*e>='0' && *e<='9') || *e==';'))
+				e++;
+			if (*e=='c')
+				done = true;
+			da = strstr(da+1,"\x1B[?");
+		}
+		if (done)
+			break;
+	}
+	buf[len] = 0;
+
+	char* q = strstr(buf,"\x1B[?");
+	while (q)
+	{
+		char* e = q+3;
+		while (*e>='0' && *e<='9')
+			e++;
+		if (*e=='u' && e>q+3)
+			return true;
+		q = strstr(q+1,"\x1B[?");
+	}
+	return false;
+}
+
+#ifdef HAVE_X11
 static void select_events(Display *dpy, Window win)
 {
     XIEventMask evmasks[2];
@@ -792,6 +1181,7 @@ static void select_events(Display *dpy, Window win)
     XISelectEvents(dpy, win, evmasks, 2);
     XFlush(dpy);
 }
+#endif
 
 
 
@@ -828,12 +1218,27 @@ int terminal_init(int argc, char* argv[], int* dw, int* dh)
 
     printf("W=%d, H=%d\n",cols,rows);
 
+	const char* wayland = getenv("WAYLAND_DISPLAY");
+	const char* display = getenv("DISPLAY");
+
 	if (raw_keyboard)
 	{
 		printf("Using RAW Keyboard... excelent!\n");
 	}
 	else
+	if (detect_kitty())
 	{
+		// disambiguate, report press/repeat/release, alternate keys,
+		// all keys as escape codes; and focus in/out
+		printf("\x1B[>15u\x1B[?1004h");
+		kitty_keyboard = true;
+	}
+#ifdef HAVE_X11
+	else
+	if (!(wayland && wayland[0]) && display && display[0] && load_x11())
+	{
+		// X11 gives key releases; under Wayland it would not see the
+		// terminal's keys at all
 		printf("Falling back to X11 input\n");
 		dpy = XOpenDisplay(NULL);
 
@@ -893,6 +1298,7 @@ int terminal_init(int argc, char* argv[], int* dw, int* dh)
 			}
 		}
 	}
+#endif
 
 	ansi_screen(true);
     ansi_set_wrap(false);

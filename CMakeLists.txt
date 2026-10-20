@@ -14,9 +14,8 @@ find_package(Threads)
 
 if(web)
   find_path(EMSCRIPTEN_INCLUDE_DIR NAMES emscripten.h REQUIRED)
-elseif(UNIX)
-  find_package(X11 REQUIRED)
-  find_library(XI_LIBRARY NAMES Xi REQUIRED)
+elseif(UNIX AND NOT APPLE)
+  # X11 and XInput2 headers only: the libraries are loaded at run time
   find_path(XI_INCLUDE_DIR NAMES X11/extensions/XInput2.h REQUIRED)
 endif()
 
@@ -43,8 +42,12 @@ if(web)
 elseif(UNIX)
   target_compile_definitions(asciipat PRIVATE NIX)
   target_sources(asciipat PRIVATE spec_nix.cpp miniaudio/miniaudio.c)
-  target_link_libraries(asciipat PRIVATE X11::X11 ${XI_LIBRARY} ${CMAKE_DL_LIBS} m)
-  target_include_directories(asciipat PRIVATE ${XI_INCLUDE_DIR})
+  target_link_libraries(asciipat PRIVATE ${CMAKE_DL_LIBS} m)
+  if(APPLE)
+    target_link_libraries(asciipat PRIVATE "-framework CoreFoundation" "-framework CoreAudio" "-framework AudioToolbox")
+  else()
+    target_include_directories(asciipat PRIVATE ${XI_INCLUDE_DIR})
+  endif()
 elseif(WIN32)
   target_compile_definitions(asciipat PRIVATE WIN
   "$<$<BOOL:${MSVC}>:NOMINMAX;_CRT_SECURE_NO_WARNINGS>"
