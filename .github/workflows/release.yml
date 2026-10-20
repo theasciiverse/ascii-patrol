@@ -1,0 +1,136 @@
+# Builds ascii-patrol for the Asciiverse catalog: one archive per target,
+# ascii-patrol-<target>.tar.gz (.zip on Windows), plus SHA256SUMS,
+# attached to a GitHub release (hub/catalog/SCHEMA.md, release.source =
+# "github"). Runs on our tags (*-av.*), or by hand for an existing tag.
+#
+# Built by asciiverse/Makefile. Linux builds are glibc, not static musl:
+# miniaudio loads PulseAudio, PipeWire or ALSA at run time, and the
+# X11 fallback loads libX11 and libXi, which a static binary cannot do.
+# They are built on Ubuntu 22.04 with libstdc++ linked in, so they run on
+# glibc 2.35 and newer and need nothing else to start. macOS uses Core
+# Audio through miniaudio. Windows is cross-built with MinGW against the
+# console API and DirectSound (spec_win.cpp).
+
+name: release
+
+on:
+  push:
+    tags: ["*-av.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to build and release"
+        required: true
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build and package
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libx11-dev libxi-dev
+          make -f asciiverse/Makefile -j4 LDFLAGS="-static-libstdc++ -static-libgcc -s"
+          file asciipat
+          # nothing beyond libc and libm
+          ldd asciipat
+          ! ldd asciipat | grep -Eq 'libX|libpulse|libasound|libstdc'
+          asciiverse/package.sh ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-apple-darwin, arch: x86_64 }
+          - { target: aarch64-apple-darwin, arch: arm64 }
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build and package
+        run: |
+          make -f asciiverse/Makefile -j4 CXX=clang++ CC=clang \
+            CXXFLAGS="-O2 -arch ${{ matrix.arch }}" CFLAGS="-O2 -arch ${{ matrix.arch }}" \
+            LDFLAGS="-arch ${{ matrix.arch }}"
+          strip asciipat
+          file asciipat
+          otool -L asciipat
+          asciiverse/package.sh ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  windows:
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: x86_64-pc-windows-gnu
+      CROSS: x86_64-w64-mingw32
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build and package
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++-mingw-w64-x86-64 zip
+          make -f asciiverse/Makefile -j4 PLATFORM=win CXX=$CROSS-g++ CC=$CROSS-gcc LDFLAGS="-s"
+          file asciipat.exe
+          # system DLLs only
+          $CROSS-objdump -p asciipat.exe | grep "DLL Name"
+          asciiverse/package.sh $TARGET
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TARGET }}
+          path: dist/*
+
+  release:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "ascii-patrol $TAG" \
+                 --notes "ascii-patrol $TAG, Marcin Sokalski's ASCII homage to Moon Patrol, with the changes in PATCHES.md, built for the Asciiverse catalog."
+          gh release upload "$TAG" dist/* -R "$GITHUB_REPOSITORY" --clobber

@@ -1,0 +1,8 @@
+*.o
+miniaudio/*.o
+depend
+/asciipat
+/asciipat.exe
+/build/
+/stage/
+/dist/
