@@ -89,3 +89,9 @@ LICENSE, README.md, PATCHES.md and MINIAUDIO-LICENSE. Upstream's CI
 workflow, which builds against PulseAudio, is removed. The upstream
 Makefile and CMakeLists.txt still work, without PulseAudio or X11
 libraries.
+
+## Ours
+
+- **How to play it, at the top of README.md.** A short note on installing and
+  starting it with av, or from a release archive; the original text follows
+  unchanged.
